@@ -1,0 +1,178 @@
+name: Deploy Server to EC2
+
+on:
+    push:
+      branches:
+        - MAIN-3535
+    workflow_dispatch:
+
+jobs:
+  create-scheduler-docker-image:
+    runs-on: ubuntu-latest
+    permissions:
+      deployments: write
+      contents: read
+      statuses: write
+    outputs:
+      ECR_REGISTRY: ${{ steps.build-image.outputs.ECR_REGISTRY }}
+      ECR_REPOSITORY: ${{ steps.build-image.outputs.ECR_REPOSITORY }}
+      IMAGE_TAG: ${{ steps.build-image.outputs.IMAGE_TAG }}
+      customers: ${{ steps.customers.outputs.customers }}
+
+    steps:
+      - name: Get git output names
+        id: git
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" != "refs/tags/"* ]]; then
+            if [[ ${{ github.event_name }} == 'pull_request' ]]; then
+              echo "::set-output name=current_branch::$HEAD_REF"
+            else
+              echo "::set-output name=current_branch::$REF_BRANCH"
+            fi
+          else
+            REF=$(printf "%q" "${{ github.ref }}")
+            REF_BRANCH=${REF/refs\/tags\/${{ inputs.strip_tag_prefix }}/}
+            echo "::set-output name=current_branch::$(eval printf "%s" "$REF_BRANCH")"
+          fi
+
+      - name: Create GitHub deployment
+        uses: chrnorm/deployment-action@v2
+        id: deployment
+        with:
+          token: '${{ github.token }}'
+          environment: production
+          ref: ${{ steps.git.outputs.current_branch }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+
+      - name: get the ssm paramaters
+        id: customers
+        run: |
+          customers=$(aws ssm get-parameter --name prod-scheduler-deployments --query "Parameter.Value" --output text)
+          echo $customers
+          customers="[${customers}]"
+          echo $customers
+          echo "customers=$customers" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: scheduler-test
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build a docker container and
+          # push it to ECR so that it can
+          # be deployed to EC2
+          docker build -f Dockerfile-obf -t $ECR_REGISTRY/$ECR_REPOSITORY:backend-obf .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:backend-obf
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "ECR_REGISTRY=$ECR_REGISTRY" >> "$GITHUB_OUTPUT"
+          echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> "$GITHUB_OUTPUT"
+
+      - name: Update deployment status (success)
+        if: success()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+          state: 'success'
+          ref: ${{ steps.git.outputs.current_branch }}
+
+      - name: Update deployment status (failure)
+        if: failure()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+          state: 'failure'
+          ref: ${{ steps.git.outputs.current_branch }}
+
+  deploy-scheduler-to-aws:
+    needs: create-scheduler-docker-image
+    strategy:
+      matrix:
+        customers: ${{ fromJSON(needs.create-scheduler-docker-image.outputs.customers) }}
+    runs-on: ubuntu-latest
+    permissions:
+      deployments: write
+      contents: read
+      statuses: write
+    env:
+      ECR_REGISTRY: ${{ needs.create-scheduler-docker-image.outputs.ECR_REGISTRY }}
+      ECR_REPOSITORY: ${{ needs.create-scheduler-docker-image.outputs.ECR_REPOSITORY }}
+      IMAGE_TAG: ${{ needs.create-scheduler-docker-image.outputs.IMAGE_TAG }}
+
+    steps:
+      - name: Get git output names
+        id: git
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" != "refs/tags/"* ]]; then
+            if [[ ${{ github.event_name }} == 'pull_request' ]]; then
+              echo "::set-output name=current_branch::$HEAD_REF"
+            else
+              echo "::set-output name=current_branch::$REF_BRANCH"
+            fi
+          else
+            REF=$(printf "%q" "${{ github.ref }}")
+            REF_BRANCH=${REF/refs\/tags\/${{ inputs.strip_tag_prefix }}/}
+            echo "::set-output name=current_branch::$(eval printf "%s" "$REF_BRANCH")"
+          fi
+
+      - name: Create GitHub deployment
+        uses: chrnorm/deployment-action@v2
+        id: deployment
+        with:
+          token: '${{ github.token }}'
+          environment: production
+          ref: ${{ steps.git.outputs.current_branch }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Update deployment status (success)
+        if: success()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+          state: 'success'
+          ref: ${{ steps.git.outputs.current_branch }}
+
+      - name: Update deployment status (failure)
+        if: failure()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: '${{ github.token }}'
+          deployment-id: ${{ steps.deployment.outputs.deployment_id }}
+          state: 'failure'
+          ref: ${{ steps.git.outputs.current_branch }}
